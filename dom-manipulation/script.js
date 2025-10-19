@@ -919,3 +919,187 @@ document.addEventListener("DOMContentLoaded", () => {
     // kick off auto sync (optional), or call startServerSync() from your app menu
     // startServerSync();
   });
+
+  /* =========================================================
+   QUOTES SYNC — mock server (JSONPlaceholder)
+   Satisfies:
+   - fetchQuotesFromServer()
+   - postQuoteToServer()
+   - syncQuotes()
+   - periodic polling (startQuotePolling/stopQuotePolling)
+   - update LS w/ server-precedence conflict resolution
+   - UI notifications for updates/conflicts
+   ========================================================= */
+
+const API_BASE = "https://jsonplaceholder.typicode.com";
+const LS_CONFLICTS = "quotes.sync.conflicts.v1";
+const POLL_MS = 15000;
+
+/* ---- fallbacks if not already present ---- */
+window.loadQuotes ||= function () {
+  try { return JSON.parse(localStorage.getItem("quotes.data.v1")) || []; } catch { return []; }
+};
+window.saveQuotes ||= function () {
+  localStorage.setItem("quotes.data.v1", JSON.stringify(quotes));
+};
+window.quotes ||= loadQuotes();
+
+/* ---- tiny toast ---- */
+(function ensureToast() {
+  if (document.getElementById("toast")) return;
+  const t = document.createElement("div");
+  t.id = "toast";
+  Object.assign(t.style, {position:"fixed",left:"50%",bottom:"24px",transform:"translateX(-50%)",
+    background:"#111",color:"#fff",padding:"10px 14px",borderRadius:"999px",opacity:"0",
+    pointerEvents:"none",transition:"opacity .2s",zIndex:9999,fontSize:"14px"});
+  document.body.appendChild(t);
+})();
+function toast(msg){const t=document.getElementById("toast");t.textContent=msg;t.style.opacity=".95";
+  clearTimeout(t._timer);t._timer=setTimeout(()=>t.style.opacity="0",1600);}
+
+/* ---- UTIL: normalize to our shape ---- */
+function mkServerQuote(p){ // JSONPlaceholder post -> our quote
+  return {
+    id: `srv-${p.id}`,
+    text: String(p.body || p.title || "Untitled").trim(),
+    category: "Server",
+    updatedAt: Date.now(),
+    _src: "server", _dirty: false
+  };
+}
+function mkLocalQuote(text, category){
+  return {
+    id: `loc-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+    text, category: category || "", updatedAt: Date.now(),
+    _src: "local", _dirty: true
+  };
+}
+
+/* ---- REQUIRED: fetch from mock API ---- */
+async function fetchQuotesFromServer(limit = 10) {
+  const res = await fetch(`${API_BASE}/posts?_limit=${limit}`);
+  if (!res.ok) throw new Error("Failed to fetch quotes from server");
+  const posts = await res.json();
+  return posts.map(mkServerQuote);
+}
+
+/* ---- REQUIRED: POST to mock API (one quote) ---- */
+async function postQuoteToServer(quote) {
+  const res = await fetch(`${API_BASE}/posts`, {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ title: quote.category || "Quote", body: quote.text })
+  });
+  if (!res.ok) throw new Error("Failed to post quote to server");
+  // JSONPlaceholder returns a fake id; mark as synced
+  const payload = await res.json();
+  quote._dirty = false;
+  quote._src = "server";
+  quote.updatedAt = Date.now();
+  // optionally mirror server id namespace (keeps it deterministic for tests)
+  if (!String(quote.id).startsWith("srv-")) quote.id = `srv-${payload.id || quote.id}`;
+  return quote;
+}
+
+/* ---- merge (server-wins) + conflict capture ---- */
+function mergeServerIntoLocal(serverQuotes) {
+  const byId = new Map(quotes.map(q => [q.id, q]));
+  const conflicts = [];
+
+  serverQuotes.forEach(sq => {
+    const local = byId.get(sq.id);
+    if (!local) { quotes.push(sq); return; }
+
+    const differs = local.text !== sq.text || (local.category||"") !== (sq.category||"");
+    if (differs) {
+      conflicts.push({ id: sq.id, server: sq, local: { ...local } });
+      Object.assign(local, sq); // server overwrites
+    } else {
+      local._dirty = false; local._src = "server";
+    }
+  });
+
+  if (conflicts.length) {
+    localStorage.setItem(LS_CONFLICTS, JSON.stringify(conflicts));
+    showConflictBanner(conflicts.length);
+    toast(`${conflicts.length} conflict(s) resolved (server won).`);
+  }
+
+  saveQuotes();
+  // optional UI refresh hooks if present in your app:
+  if (typeof populateCategories === "function") populateCategories();
+  if (typeof filterQuotes === "function") filterQuotes();
+}
+
+/* ---- REQUIRED: full sync ---- */
+async function syncQuotes() {
+  // 1) push local dirty
+  const dirty = quotes.filter(q => q._dirty);
+  if (dirty.length) {
+    await Promise.allSettled(dirty.map(q => postQuoteToServer(q)));
+    saveQuotes();
+  }
+  // 2) pull server
+  const serverQuotes = await fetchQuotesFromServer(10);
+  // 3) merge (server wins)
+  mergeServerIntoLocal(serverQuotes);
+  toast("Sync complete.");
+}
+
+/* ---- REQUIRED: periodic checking ---- */
+let _pollTimer = null;
+function startQuotePolling(intervalMs = POLL_MS) {
+  if (_pollTimer) clearInterval(_pollTimer);
+  _pollTimer = setInterval(syncQuotes, intervalMs);
+  syncQuotes(); // run immediately
+}
+function stopQuotePolling() {
+  if (_pollTimer) clearInterval(_pollTimer);
+  _pollTimer = null;
+}
+
+/* ---- UI: conflict banner ---- */
+function showConflictBanner(count) {
+  let bar = document.getElementById("syncBanner");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "syncBanner";
+    Object.assign(bar.style, {position:"fixed",top:0,left:0,right:0,padding:"10px 14px",
+      background:"#0f172a",color:"#fff",display:"flex",gap:"8px",alignItems:"center",zIndex:9998});
+    document.body.appendChild(bar);
+  }
+  bar.innerHTML = `🔄 Sync notice: <strong>${count}</strong> conflict(s) auto-resolved (server kept).
+    <button id="viewConflictsBtn">View</button>
+    <button id="dismissSyncBtn">Dismiss</button>`;
+  bar.style.display = "flex";
+  document.getElementById("dismissSyncBtn").onclick = () => (bar.style.display = "none");
+  document.getElementById("viewConflictsBtn").onclick = () => {
+    const list = JSON.parse(localStorage.getItem(LS_CONFLICTS) || "[]");
+    alert(
+      list.map((c,i)=>`${i+1}. ID ${c.id}\n  Server: ${c.server.text} (${c.server.category})\n  Local : ${c.local.text} (${c.local.category})`).join("\n\n") || "No conflicts."
+    );
+  };
+}
+
+/* ---- expose helpers for tests / buttons ---- */
+window.mkLocalQuote = mkLocalQuote;
+window.fetchQuotesFromServer = fetchQuotesFromServer;
+window.postQuoteToServer = postQuoteToServer;
+window.syncQuotes = syncQuotes;
+window.startQuotePolling = startQuotePolling;
+window.stopQuotePolling = stopQuotePolling;
+
+/* ---- OPTIONAL: enhance your addQuote to mark dirty ---- */
+(function wrapAdd(){
+  const prev = window.addQuote;
+  window.addQuote = function() {
+    if (typeof prev === "function") return prev(); // your version already pushes + saves
+    const t = document.getElementById("newQuoteText")?.value?.trim();
+    const c = document.getElementById("newQuoteCategory")?.value?.trim() || "";
+    if (!t || t.length < 3) { alert("Please enter a longer quote."); return; }
+    quotes.push(mkLocalQuote(t, c)); saveQuotes(); toast("Added locally (will sync).");
+  };
+})();
+
+/* ---- START polling if you want it automatic on load ---- */
+// startQuotePolling();   // uncomment to enable auto-sync on page load
