@@ -371,11 +371,270 @@ window.addQuote = addQuote;
 
 // Initial paint
 document.addEventListener("DOMContentLoaded", render);
-  
-  
-  
+function importFromJsonFile(event) {
+  const fileReader = new FileReader();
+  fileReader.onload = function(event) {
+    const importedQuotes = JSON.parse(event.target.result);
+    quotes.push(...importedQuotes);
+    saveQuotes();
+    alert('Quotes imported successfully!');
+  };
+  fileReader.readAsText(event.target.files[0]);
+}
 
-  
-  
-  
-  
+/* Storage keys */
+const LS_KEY = "quotes.data.v1";
+const SS_LAST_VIEWED_KEY = "quotes.lastViewed.v1";
+
+/* Defaults */
+const DEFAULT_QUOTES = [
+  { text: "The best way to predict the future is to create it.", category: "Inspiration" },
+  { text: "Simplicity is the soul of efficiency.", category: "Productivity" },
+];
+
+/* Helpers */
+const $ = (s, r = document) => r.querySelector(s);
+
+function loadQuotes() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    const arr = raw ? JSON.parse(raw) : null;
+    return Array.isArray(arr) ? arr : null;
+  } catch {
+    return null;
+  }
+}
+function saveQuotes() {
+  localStorage.setItem(LS_KEY, JSON.stringify(quotes));
+}
+
+/* Safe init */
+let quotes = (() => {
+  const loaded = loadQuotes();
+  if (Array.isArray(loaded)) {
+    return loaded
+      .filter(q => q && typeof q.text === "string")
+      .map(q => ({ text: String(q.text).trim(), category: q.category ? String(q.category).trim() : "" }));
+  }
+  return DEFAULT_QUOTES.slice();
+})();
+
+/* Rendering */
+function renderQuote(q) {
+  const qText = $("#quoteText");
+  const qCat  = $("#quoteCategory");
+
+  if (qText && qCat) {
+    qText.textContent = q ? `“${q.text}”` : "No quotes yet. Add one below!";
+    qCat.textContent  = q?.category ? `#${q.category}` : "";
+    return;
+  }
+
+  // Fallback list under the form
+  let list = $("#quotesList");
+  if (!list) {
+    const host = $("#newQuoteText")?.closest("div") || document.body;
+    list = document.createElement("ul");
+    list.id = "quotesList";
+    list.style.marginTop = "10px";
+    host.appendChild(list);
+  }
+  list.innerHTML = "";
+  quotes.forEach(({ text, category }) => {
+    const li = document.createElement("li");
+    li.textContent = category ? `${text} — (${category})` : text;
+    list.appendChild(li);
+  });
+}
+
+function showRandomQuote() {
+  if (!quotes.length) {
+    renderQuote(null);
+    return;
+  }
+  const q = quotes[Math.floor(Math.random() * quotes.length)];
+  renderQuote(q);
+
+  // Session-only: remember last viewed for this tab
+  sessionStorage.setItem(SS_LAST_VIEWED_KEY, JSON.stringify(q));
+}
+window.showRandomQuote = showRandomQuote;
+
+/* Add quote from inputs #newQuoteText / #newQuoteCategory */
+function addQuote() {
+  const textEl = $("#newQuoteText");
+  const catEl  = $("#newQuoteCategory");
+  const text = textEl?.value.trim() || "";
+  const category = catEl?.value.trim() || "";
+
+  if (text.length < 3) {
+    alert("Please enter a longer quote.");
+    textEl?.focus();
+    return;
+  }
+
+  quotes.push({ text, category });
+  saveQuotes();               // <-- Local Storage on every change
+  renderQuote(quotes[quotes.length - 1]);
+
+  if (textEl) textEl.value = "";
+  if (catEl) catEl.value = "";
+  textEl?.focus();
+}
+window.addQuote = addQuote;
+
+/* JSON Export */
+function exportQuotesToJson(filename = `quotes-${new Date().toISOString().slice(0,10)}.json`) {
+  const blob = new Blob([JSON.stringify(quotes, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+window.exportQuotesToJson = exportQuotesToJson;
+
+/* JSON Import (validated, persisted, rendered) */
+function importFromJsonFile(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const parsed = JSON.parse(e.target.result);
+      if (!Array.isArray(parsed)) throw new Error("JSON must be an array of {text, category}.");
+      const cleaned = parsed
+        .filter(x => x && typeof x.text === "string")
+        .map(x => ({ text: String(x.text).trim(), category: x.category ? String(x.category).trim() : "" }));
+      if (!cleaned.length) throw new Error("No valid quotes found.");
+
+      quotes.push(...cleaned);
+      saveQuotes();
+      renderQuote(quotes[quotes.length - 1]);
+      alert("Quotes imported successfully!");
+    } catch (err) {
+      alert("Import failed: " + err.message);
+    } finally {
+      // allow re-importing the same file name
+      event.target.value = "";
+    }
+  };
+  reader.readAsText(file);
+}
+window.importFromJsonFile = importFromJsonFile;
+
+/* Init */
+document.addEventListener("DOMContentLoaded", () => {
+  // Restore last viewed quote for this session if present; else show a random one.
+  const last = sessionStorage.getItem(SS_LAST_VIEWED_KEY);
+  if (last) {
+    try { renderQuote(JSON.parse(last)); return; } catch {}
+  }
+  showRandomQuote();
+});
+/* ========= Filtering: categories & persistence ========= */
+
+const LS_FILTER_KEY = "quotes.selectedCategory.v1";
+
+/** Return a sorted, de-duplicated list of categories present in quotes */
+function getUniqueCategories() {
+  return Array.from(new Set(quotes.map(q => (q.category || "").trim()).filter(Boolean))).sort();
+}
+
+/** Build the <select id="categoryFilter"> options from the quotes array.
+ *  Restores the last selected filter from Local Storage if available.
+ */
+function populateCategories() {
+  let sel = document.getElementById("categoryFilter");
+
+  // Create the dropdown if it's not on the page
+  if (!sel) {
+    // Try to place it near the add-quote inputs; fall back to body
+    const host = document.getElementById("newQuoteText")?.closest("div") || document.body;
+    sel = document.createElement("select");
+    sel.id = "categoryFilter";
+    sel.style.margin = "8px 0";
+    host.prepend(sel);
+  }
+
+  const last = localStorage.getItem(LS_FILTER_KEY) || "";
+  const cats = getUniqueCategories();
+
+  // (Re)build options
+  sel.innerHTML = "";
+  sel.append(new Option("All categories", "")); // empty value = no filter
+  cats.forEach(c => sel.append(new Option(c, c)));
+
+  // restore last if still valid
+  sel.value = cats.includes(last) ? last : "";
+
+  // ensure one change handler (idempotent)
+  sel.onchange = () => {
+    localStorage.setItem(LS_FILTER_KEY, sel.value);
+    filterQuotes();
+  };
+}
+
+/** Show quotes filtered by the current dropdown selection.
+ *  Works with either the single-quote card (#quoteText/#quoteCategory)
+ *  or the fallback <ul id="quotesList"> renderer.
+ */
+function filterQuotes() {
+  const sel = document.getElementById("categoryFilter");
+  const chosen = sel ? sel.value : "";
+
+  const filtered = chosen
+    ? quotes.filter(q => (q.category || "").trim() === chosen)
+    : quotes.slice();
+
+  // If you have a single quote display, show a random one from the filtered pool
+  const qText = document.getElementById("quoteText");
+  const qCat  = document.getElementById("quoteCategory");
+
+  if (qText && qCat) {
+    if (!filtered.length) {
+      qText.textContent = "No quotes for this category yet.";
+      qCat.textContent = "";
+      return;
+    }
+    const q = filtered[Math.floor(Math.random() * filtered.length)];
+    qText.textContent = `“${q.text}”`;
+    qCat.textContent  = q.category ? `#${q.category}` : "";
+  } else {
+    // Fallback list render
+    let list = document.getElementById("quotesList");
+    if (!list) {
+      const host = document.getElementById("newQuoteText")?.closest("div") || document.body;
+      list = document.createElement("ul");
+      list.id = "quotesList";
+      host.appendChild(list);
+    }
+    list.innerHTML = "";
+    filtered.forEach(({ text, category }) => {
+      const li = document.createElement("li");
+      li.textContent = category ? `${text} — (${category})` : text;
+      list.appendChild(li);
+    });
+  }
+}
+
+/* ===== Enhance addQuote to refresh categories & keep filter consistent ===== */
+const _origAddQuote = window.addQuote || function(){};  // in case you already bound it
+window.addQuote = function enhancedAddQuote() {
+  // call your existing addQuote implementation
+  _origAddQuote();
+
+  // after quotes[] changed: persist, rebuild categories, and reapply filter
+  // (saveQuotes() is already called by your original addQuote)
+  populateCategories();
+  filterQuotes();
+};
+
+/* ===== Init: build categories, restore last filter, then render ===== */
+document.addEventListener("DOMContentLoaded", () => {
+  populateCategories();            // build dropdown from quotes[]
+  filterQuotes();                  // apply last-selected filter (restored in populateCategories)
+});
