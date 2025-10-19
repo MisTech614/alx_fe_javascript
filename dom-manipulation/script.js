@@ -638,3 +638,284 @@ document.addEventListener("DOMContentLoaded", () => {
   populateCategories();            // build dropdown from quotes[]
   filterQuotes();                  // apply last-selected filter (restored in populateCategories)
 });
+/* =========================================================
+   Server Sync (JSONPlaceholder-based simulation)
+   ========================================================= */
+
+   const SYNC = {
+    INTERVAL_MS: 15000,                                 // poll every 15s
+    LS_META_KEY: "quotes.sync.meta.v1",
+    LS_CONFLICTS_KEY: "quotes.sync.conflicts.v1",
+    BASE_URL: "https://jsonplaceholder.typicode.com",   // mock API
+    timer: null,
+  };
+  
+  // Ensure helpers exist
+  const $ = window.$ || ((s, r = document) => r.querySelector(s));
+  
+  // Lightweight toast (if you already have one, this is no-op)
+  (function ensureToast() {
+    if (document.getElementById("toast")) return;
+    const t = document.createElement("div");
+    t.id = "toast";
+    Object.assign(t.style, {
+      position: "fixed", left: "50%", bottom: "24px", transform: "translateX(-50%)",
+      background: "#111", color: "#fff", padding: "10px 14px", borderRadius: "999px",
+      opacity: "0", pointerEvents: "none", transition: "opacity .2s ease", fontSize: "14px", zIndex: 9999
+    });
+    document.body.appendChild(t);
+  })();
+  function toast(msg) {
+    const t = document.getElementById("toast");
+    if (!t) return alert(msg);
+    t.textContent = msg;
+    t.style.opacity = "0.95";
+    clearTimeout(t._timer);
+    t._timer = setTimeout(() => (t.style.opacity = "0"), 1800);
+  }
+  
+  // ---- Sync meta (stored in LS so it survives reloads)
+  function loadSyncMeta() {
+    try { return JSON.parse(localStorage.getItem(SYNC.LS_META_KEY)) || { lastSync: 0 }; }
+    catch { return { lastSync: 0 }; }
+  }
+  function saveSyncMeta(meta) {
+    localStorage.setItem(SYNC.LS_META_KEY, JSON.stringify(meta));
+  }
+  
+  // ---- Conflicts (persist so user can resolve later)
+  function loadConflicts() {
+    try { return JSON.parse(localStorage.getItem(SYNC.LS_CONFLICTS_KEY)) || []; }
+    catch { return []; }
+  }
+  function saveConflicts(list) {
+    localStorage.setItem(SYNC.LS_CONFLICTS_KEY, JSON.stringify(list));
+  }
+  
+  // ---- Mapping: server <-> app
+  function serverToQuote(post) {
+    // JSONPlaceholder has { id, title, body, userId }. We'll use body as text.
+    return {
+      id: `srv-${post.id}`,                // namespace server ids
+      text: String(post.body || post.title || "").trim() || "Untitled",
+      category: "Server",                  // simple default
+      updatedAt: Date.now(),               // mock timestamp (no server clock)
+      _src: "server",
+    };
+  }
+  function makeLocalQuote(text, category) {
+    return {
+      id: `loc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      text, category, updatedAt: Date.now(), _src: "local", _dirty: true
+    };
+  }
+  
+  // ---- Public API to create local quotes with sync metadata (optional use)
+  window.addQuoteWithSync = function(text, category) {
+    quotes.push(makeLocalQuote(text, category));
+    saveQuotes();
+    toast("Added locally (will sync).");
+  };
+  
+  // ---- Core: fetch & merge
+  async function fetchServerQuotes() {
+    const res = await fetch(`${SYNC.BASE_URL}/posts?_limit=10`); // limit for demo
+    if (!res.ok) throw new Error("Server fetch failed");
+    const posts = await res.json();
+    return posts.map(serverToQuote);
+  }
+  
+  async function pushLocalDirty() {
+    const dirty = quotes.filter(q => q._dirty);
+    if (!dirty.length) return;
+  
+    // Simulate POST each dirty quote (JSONPlaceholder won’t persist; that’s okay)
+    await Promise.all(dirty.map(async q => {
+      const res = await fetch(`${SYNC.BASE_URL}/posts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: q.category || "Quote", body: q.text })
+      });
+      if (res.ok) {
+        q._dirty = false;                 // mark as synced
+        q.updatedAt = Date.now();
+        q._src = "server";                // assume server accepted it
+      }
+    }));
+    saveQuotes();
+  }
+  
+  function mergeServerIntoLocal(serverQuotes) {
+    // Build indices by id
+    const byId = Object.fromEntries(quotes.map(q => [q.id || `${q.text}-${q.category}`, q]));
+  
+    const conflicts = [];
+  
+    // Upsert server quotes into local (server wins on conflict)
+    serverQuotes.forEach(sq => {
+      const key = sq.id || `${sq.text}-${sq.category}`;
+      const local = byId[key];
+  
+      if (!local) {
+        quotes.push(sq);
+        return;
+      }
+  
+      // Conflict: both exist and differ. Strategy: server wins, keep a backup copy for manual resolve.
+      const differs = local.text !== sq.text || local.category !== sq.category;
+      if (differs) {
+        conflicts.push({ id: key, server: sq, local: { ...local } });
+        Object.assign(local, sq); // overwrite with server
+      } else {
+        // No diff -> prefer non-dirty state
+        local._dirty = false;
+        local._src = "server";
+      }
+    });
+  
+    if (conflicts.length) {
+      saveConflicts(conflicts);
+      toast(`Sync: ${conflicts.length} conflict(s) resolved (server won).`);
+      showConflictBanner(conflicts.length);
+    }
+  
+    // Remove duplicates (same text/category different ids) – optional clean-up
+    // Not implemented aggressively to avoid accidental data loss.
+  
+    saveQuotes();
+  }
+  
+  // ---- UI: conflict banner + manual resolve
+  function ensureBannerHost() {
+    let bar = document.getElementById("syncBanner");
+    if (bar) return bar;
+    bar = document.createElement("div");
+    bar.id = "syncBanner";
+    Object.assign(bar.style, {
+      position: "fixed", top: "0", left: "0", right: "0", padding: "10px 14px",
+      background: "#0f172a", color: "#fff", display: "none", zIndex: 9998
+    });
+    document.body.appendChild(bar);
+    return bar;
+  }
+  function showConflictBanner(count) {
+    const bar = ensureBannerHost();
+    bar.innerHTML = `
+      <strong>Sync notice:</strong> ${count} conflict(s) auto-resolved (server version kept).
+      <button id="viewConflictsBtn" style="margin-left:8px;">View</button>
+      <button id="dismissSyncBtn" style="margin-left:8px;">Dismiss</button>
+    `;
+    bar.style.display = "block";
+    $("#viewConflictsBtn").onclick = openConflictsModal;
+    $("#dismissSyncBtn").onclick = () => (bar.style.display = "none");
+  }
+  function openConflictsModal() {
+    const list = loadConflicts();
+    if (!list.length) { toast("No conflicts to review."); return; }
+  
+    // Simple modal
+    let modal = document.getElementById("conflictModal");
+    if (!modal) {
+      modal = document.createElement("div");
+      modal.id = "conflictModal";
+      Object.assign(modal.style, {
+        position: "fixed", inset: "0", background: "rgba(0,0,0,.45)", display: "flex",
+        alignItems: "center", justifyContent: "center", zIndex: 10000
+      });
+      const inner = document.createElement("div");
+      Object.assign(inner.style, { background: "#fff", padding: "16px", borderRadius: "10px", maxWidth: "640px", width: "90%", maxHeight: "70vh", overflow: "auto" });
+      inner.id = "conflictInner";
+      modal.appendChild(inner);
+      document.body.appendChild(modal);
+      modal.addEventListener("click", e => { if (e.target === modal) modal.remove(); });
+    }
+  
+    const inner = document.getElementById("conflictInner");
+    inner.innerHTML = `<h3>Conflicts</h3>
+      <p>Server version was applied. You can restore your local version for any item below.</p>`;
+  
+    list.forEach((c, i) => {
+      const row = document.createElement("div");
+      row.style.borderTop = "1px solid #eee";
+      row.style.paddingTop = "8px";
+      row.innerHTML = `
+        <div style="font-size:13px; opacity:.75">ID: ${c.id}</div>
+        <div><strong>Server:</strong> ${c.server.text} <em>(${c.server.category})</em></div>
+        <div><strong>Local :</strong> ${c.local.text} <em>(${c.local.category})</em></div>
+        <button data-index="${i}" class="restoreLocalBtn" style="margin-top:6px;">Restore Local Version</button>
+      `;
+      inner.appendChild(row);
+    });
+    const close = document.createElement("button");
+    close.textContent = "Close";
+    close.style.marginTop = "12px";
+    close.onclick = () => modal.remove();
+    inner.appendChild(close);
+  
+    inner.querySelectorAll(".restoreLocalBtn").forEach(btn => {
+      btn.onclick = () => {
+        const idx = Number(btn.getAttribute("data-index"));
+        const c = list[idx];
+        const target = quotes.find(q => (q.id || `${q.text}-${q.category}`) === c.id);
+        if (target) Object.assign(target, c.local, { _dirty: true, updatedAt: Date.now() });
+        saveQuotes();
+        toast("Local version restored (will push on next sync).");
+      };
+    });
+  }
+  
+  /* ---- SYNC ORCHESTRATION ---- */
+  async function syncOnce() {
+    try {
+      await pushLocalDirty();
+      const serverQuotes = await fetchServerQuotes();    // simulate incoming updates
+      mergeServerIntoLocal(serverQuotes);
+      saveSyncMeta({ lastSync: Date.now() });
+      // Rebuild filters/categories if your UI has them:
+      if (typeof populateCategories === "function") populateCategories();
+      if (typeof filterQuotes === "function") filterQuotes();
+      toast("Sync complete.");
+    } catch (err) {
+      console.error(err);
+      toast("Sync failed. Check console.");
+    }
+  }
+  function startServerSync(intervalMs = SYNC.INTERVAL_MS) {
+    if (SYNC.timer) clearInterval(SYNC.timer);
+    SYNC.timer = setInterval(syncOnce, intervalMs);
+    syncOnce(); // run immediately
+  }
+  function stopServerSync() {
+    if (SYNC.timer) clearInterval(SYNC.timer);
+    SYNC.timer = null;
+  }
+  function syncNow() { return syncOnce(); }
+  
+  // Expose controls
+  window.startServerSync = startServerSync;
+  window.stopServerSync = stopServerSync;
+  window.syncNow = syncNow;
+  
+  /* ---- OPTIONAL: add quick UI controls ---- */
+  (function ensureSyncControls() {
+    if (document.getElementById("syncControls")) return;
+    const host = document.getElementById("newQuoteText")?.closest("div") || document.body;
+    const wrap = document.createElement("div");
+    wrap.id = "syncControls";
+    wrap.style.marginTop = "8px";
+    wrap.innerHTML = `
+      <button id="syncNowBtn">Sync Now</button>
+      <button id="syncStartBtn">Start Auto Sync</button>
+      <button id="syncStopBtn">Stop Auto Sync</button>
+    `;
+    host.appendChild(wrap);
+    $("#syncNowBtn").onclick = syncNow;
+    $("#syncStartBtn").onclick = () => { startServerSync(); toast("Auto sync ON"); };
+    $("#syncStopBtn").onclick = () => { stopServerSync(); toast("Auto sync OFF"); };
+  })();
+  
+  /* ---- BOOT ---- */
+  document.addEventListener("DOMContentLoaded", () => {
+    // kick off auto sync (optional), or call startServerSync() from your app menu
+    // startServerSync();
+  });
